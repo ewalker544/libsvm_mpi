@@ -14,6 +14,7 @@
 #include "mpi.h"
 #include <iostream>
 
+
 int libsvm_version = LIBSVM_VERSION;
 typedef float Qfloat;
 typedef signed char schar;
@@ -565,6 +566,7 @@ void Solver::Solve(int l, const QMatrix& Q, const double *p_, const schar *y_,
 		}
 	}
 
+
 	// optimization step
 
 	int iter = 0;
@@ -831,20 +833,24 @@ int Solver::select_working_set(int &out_i, int &out_j)
 			if(y[t]==+1)	
 			{
 				if(!is_upper_bound(t))
+				{
 					if(-G[t] >= t_Gmax)
 					{
 						t_Gmax = -G[t];
 						t_Gmax_idx = t;
 					}
+				}
 			}
 			else
 			{
 				if(!is_lower_bound(t))
+				{
 					if(G[t] >= t_Gmax)
 					{
 						t_Gmax = G[t];
 						t_Gmax_idx = t;
 					}
+				}
 			}
 		}
 
@@ -1358,6 +1364,7 @@ public:
 	Qfloat *get_Q(int i, int len) const
 	{
 		Qfloat *data;
+
 		int start;
 		if((start = cache->get_data(i,&data,len)) < len)
 		{
