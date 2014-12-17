@@ -4,7 +4,8 @@
 #include <ctype.h>
 #include <errno.h>
 #include "svm.h"
-#include "mpi.h"
+#include <mpi.h>
+#include <iostream>
 
 #define Malloc(type,n) (type *)malloc((n)*sizeof(type))
 
