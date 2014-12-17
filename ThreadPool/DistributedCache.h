@@ -6,8 +6,11 @@
 #include <list>
 #include <vector>
 #include <functional>
+#include <string>
+#include <fstream>
+#include <limits>
 #include <memory>
-#include "mpi.h"
+#include <mpi.h>
 
 #include "SvmThreads.h"
 #include "LRUCache.h"
@@ -21,102 +24,72 @@ class DistributedCache : public LRUCache
 {
 public:
 
-	DistributedCache(int l_, const schar *y, std::function<double(int,int)> func) : l(l_)
+	DistributedCache(int l_, const schar *y_, std::function<double(int,int)> func_) : 
+		l(l_), kernel(func_)
 	{
-		setup(y, func);
+		schar * y = new schar[l];
+		memcpy(y, y_, l * sizeof(schar));
 
-		if (my_rank == 0) {
-			// cache at least 50 columns or 10% if one node share
-			max_local_cache = int(std::max(50.0, 0.1 * (l / world_size)));
-
-			// table for all the other column indicies not in the local 
-			int table_size = l - end;
-			RemoteCacheTable.reserve(table_size);
-			for (int i = 0; i < table_size; ++i) {
-				RemoteCacheTable.push_back(new RemoteColumn());
-			}
-		}
+		setup();
 	}
 
     virtual ~DistributedCache()
 	{
-		if (my_rank == 0) {
-			shut_down();
+		shut_down();
 
-			while ( !RemoteCacheTable.empty() ) 
-			{
-				RemoteColumn *ptr = RemoteCacheTable.back();
-				RemoteCacheTable.pop_back();
+		while ( !RemoteCacheTable.empty() ) 
+		{
+			RemoteColumn *ptr = RemoteCacheTable.back();
+			RemoteCacheTable.pop_back();
 
-				if (ptr->valid) {
-					delete [] ptr->data;
-				}
-
-				delete ptr;
+			if (ptr->valid) {
+				delete [] ptr->data;
 			}
+
+			delete ptr;
 		}
 
-		delete [] pool; // free entire pre-allocated block
+		delete [] y;
+
 	}
 
    	/**
-	 * Gets a column of height len from the cache pool 
-	 * @return 0 if it is new memory that needs to be filled, or len if memory is already filled
+	 * Gets index column - locally or from a remote node
+	 * @return 		0 if it is new memory that needs to be filled, 
+	 * 				or len if memory is already filled
 	 */
     int get_data(const int index, Qfloat **data, int len) 
 	{
-		if (my_rank != 0) {
-			std::cerr << "Rank " << my_rank << " should not be calling get_data()\n";
-			MPI::COMM_WORLD.Abort(-1);
-		}
+		Qfloat *d = get_column(index, false); // check if column is in local cache
 
-		int partner_rank = find_rank(index);
+		if (d == NULL) { // column not in cache
 
-		if (partner_rank != my_rank) {
+			int partner_rank = find_rank(index); // find out where it is located
 
-			int tbl_idx = index - end;
-			RemoteColumn *col = RemoteCacheTable[tbl_idx];
+			if (partner_rank == 0) {  
+				// generate and cache column in rank 0
 
-			if (col->valid) { // We have a hit!
-
-				*data = col->data;
-				CacheList.erase(col->pos); // remove from list
+				*data = get_column(index, true);
+				return len;
 
 			} else {
-
-				if (CacheList.size() >= max_local_cache) {
-					RemoteColumn *ptr= CacheList.back(); // pick a column from the end of the list to reuse
-					CacheList.pop_back();   // remove it from the list
-
-					col->data = ptr->data;	// reuse its space
-					col->valid = true;      // indicate this is now valid
-
-					ptr->data = NULL;       // reset the old column
-					ptr->valid = false;     // indicate its no longer valid
-
-				} else {
-					col->data = new Qfloat[l];
-					col->valid = true;
-				}	
-
 				// Send request to partner rank for column data
+
 				MPI::COMM_WORLD.Send(&index, 1, MPI_INT, partner_rank, 0);
 
+				d = get_column_cache(index); // can a space in the cache to fill in the column data
+
 				MPI::Status status;
-				MPI::COMM_WORLD.Recv(col->data, l, MPI_FLOAT, partner_rank, 0, status);
+				MPI::COMM_WORLD.Recv(d, l, MPI_FLOAT, partner_rank, 0, status);
 
-				*data = col->data;
+				*data = d;
+				return len;
 			}
-
-			CacheList.push_front(col); // put this column in the front so we don't evict it
-			col->pos = CacheList.begin(); // store its iterator so we can delete it if we have too
-
+		}
+		else { // found column data in cache
+			*data = d;
 			return len;
-		} else {
-			int i_offset = index - start;
-			*data = &pool[linear_index(i_offset, 0)];
-			return len;
-		} 
+		}
 	}
 
     void swap_index(int i, int j)
@@ -131,23 +104,24 @@ private:
 
 	int start, end;
 	int my_rank, world_size;
+
 	int l;
+	schar *y;
+	std::function<double(int,int)> kernel;
+
 	long int size;
 	size_t max_local_cache;
 
 	Qfloat *stage[2];
 	int next_pos;
 
-	Qfloat *pool;
-
 	int linear_index(int i, int j) 
 	{
 		return i * l + j;
 	}
 
-	void setup(const schar *y, std::function<double(int,int)> func)
+	void setup()
 	{
-		SvmThreads * threads = SvmThreads::getInstance();
 
 		world_size = MPI::COMM_WORLD.Get_size();
 		my_rank = MPI::COMM_WORLD.Get_rank();
@@ -155,26 +129,29 @@ private:
 		start = my_rank * (l / world_size);
 		end = ((my_rank == world_size-1) ? l : (my_rank + 1) * (l / world_size));
 
-		size = l * (end-start);	 // size of my pool
+		// table for all the other column indicies maintained by local cache
+		int table_size;
+		if (my_rank == 0)
+			table_size = l; // master rank keeps track of everything
+		else
+			table_size = end - start; // slaves only keep track of their share
 
-		pool = new Qfloat[size];
+		RemoteCacheTable.reserve(table_size);
+		for (int i = 0; i < table_size; ++i) {
+			RemoteCacheTable.push_back(new RemoteColumn());
+		}
 
-		auto func1 = [&](int tid) {
+		size_t allocated_memory = table_size * sizeof(RemoteColumn);
 
-			int pstart = start + threads->start(tid, end-start);
-			int pend = start + threads->end(tid, end-start);
+		size_t max_size = (getPhysicalMemory() - allocated_memory) / sizeof(Qfloat); // max # Qfloats
+		size_t max_columns = max_size / l; // each column of size l
 
-			for (int i = pstart; i < pend; ++i) {
-				for (int j = 0; j < l; ++j) {
-					int i_offset = i - start;
-					pool[linear_index(i_offset, j)] = (Qfloat)(y[i]*y[j]*func(i, j));
-				}
-			}
-		};
+		double ratio = 0.8; // try caching 80% of the share of columns for each node
 
-		threads->run_workers(func1);
+		// make sure we are not storing more than 95% of the available physical memory
+		max_local_cache = size_t(std::min(ratio * (l / world_size), 0.95 * max_columns));
 
-		// Wait for all nodes to complete initializing their pool
+		// Wait for all nodes to synchronize
 		MPI::COMM_WORLD.Barrier();
 
 		if (my_rank != 0) 
@@ -193,8 +170,8 @@ private:
 					if (index >= start && index < end) {
 
 						// serve cache values to node 0
-						int i = index - start;
-						MPI::COMM_WORLD.Send(&pool[linear_index(i, 0)], l, MPI_FLOAT, 0, 0);
+						Qfloat *data = get_column(index, true);
+						MPI::COMM_WORLD.Send(data, l, MPI_FLOAT, 0, 0);
 
 					} 
 					else if (index == terminate_command) {
@@ -246,6 +223,127 @@ private:
 	std::vector<RemoteColumn *> RemoteCacheTable; // table for fast lookup
 
 	std::list<RemoteColumn *> CacheList; // list of cached columns, limited to max_local_cache
+
+	size_t getPhysicalMemory()
+	{
+		size_t default_rc = (2000 << 20); // 2 GB
+#if defined(_SC_PHYS_PAGES) && defined(_SC_PAGESIZE)
+		return (size_t)sysconf( _SC_PHYS_PAGES ) * (size_t)sysconf( _SC_PAGESIZE );
+#elif defined(_SC_PHYS_PAGES) && defined(_SC_PAGE_SIZE)
+		return (size_t)sysconf( _SC_PHYS_PAGES ) * (size_t)sysconf( _SC_PAGE_SIZE );
+#else
+		std::ifstream fin("/proc/meminfo");
+
+		if (fin.fail()) {
+			return default_rc;
+		}
+
+		std::string token;
+		while(fin >> token) {
+			if(token == "MemTotal:") {
+				size_t mem;
+				if(fin >> mem) {
+					return mem * 1024;
+				} else {
+					return default_rc;
+				}
+			}
+			// ignore rest of the line
+			fin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+		}
+		return default_rc;
+#endif
+	}
+
+	Qfloat *get_column(int index, bool fill) 
+	{
+		int tbl_idx;
+
+		if (my_rank == 0) {
+			tbl_idx = index; // master is keeping track of everything
+		} else {
+			tbl_idx = index - start;
+		}
+
+		RemoteColumn *col = RemoteCacheTable[tbl_idx];
+
+		if (col->valid) { // hit!
+
+			CacheList.erase(col->pos); // remove from list
+
+		} else { // miss!
+
+			if (!fill)
+				return NULL;
+
+			if (CacheList.size() >= max_local_cache) {
+				RemoteColumn *ptr= CacheList.back(); // pick a column from the end of the list to reuse
+				CacheList.pop_back();   // remove it from the list
+
+				col->data = ptr->data;	// reuse its space
+				fill_column(index, col->data);
+				col->valid = true;      // indicate this is now valid
+
+				ptr->data = NULL;       // reset the old column
+				ptr->valid = false;     // indicate its no longer valid
+
+			} else {
+				col->data = new Qfloat[l];
+				fill_column(index, col->data);
+				col->valid = true;
+			}	
+		}
+
+		CacheList.push_front(col); // put this column in the front so we don't evict it
+		col->pos = CacheList.begin(); // store its iterator so we can delete it later
+
+		return col->data;
+	}
+
+	void fill_column(int i, Qfloat *data)
+	{
+		SvmThreads * threads = SvmThreads::getInstance();
+
+		auto func = [&](int tid) {
+
+			int start = threads->start(tid, l);
+			int end = threads->end(tid, l);
+
+			for (int j = start; j < end; ++j) {
+				data[j] = (Qfloat)(y[i]*y[j]*kernel(i, j));
+			}
+		};
+
+		threads->run_workers(func);
+
+		return ;
+	}
+
+	Qfloat * get_column_cache(int index)
+	{
+		Qfloat * data;
+		RemoteColumn *col = RemoteCacheTable[index];
+
+		if (CacheList.size() >= max_local_cache) {
+			RemoteColumn *ptr= CacheList.back(); // pick a column from the end of the list to reuse
+			CacheList.pop_back();   // remove it from the list
+
+			col->data = ptr->data;	// reuse its space
+			col->valid = true;      // indicate this is now valid
+
+			ptr->data = NULL;       // reset the old column
+			ptr->valid = false;     // indicate its no longer valid
+
+		} else {
+			col->data = new Qfloat[l];
+			col->valid = true;
+		}	
+
+		CacheList.push_front(col); // put this column in the front so we don't evict it
+		col->pos = CacheList.begin(); // store its iterator so we can delete it later
+
+		return col->data;
+	}
 };
 
 #endif
