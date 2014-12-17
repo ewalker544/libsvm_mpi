@@ -24,6 +24,8 @@ class SvmThreads
 
 		SvmThreads() {
 			total_num_cpus = std::thread::hardware_concurrency();
+			if (total_num_cpus < 1)
+				total_num_cpus = 8;
 			thrd_pool = new ThreadPool(total_num_cpus);
 		}
 
