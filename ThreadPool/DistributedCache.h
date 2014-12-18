@@ -15,7 +15,6 @@
 #include "SvmThreads.h"
 #include "LRUCache.h"
 
-#define INRANGE(x,y) (x == 0 && y == 2)
 
 /**
  * Simple cache pool for allocating memory of fixed size
@@ -27,7 +26,7 @@ public:
 	DistributedCache(int l_, const schar *y_, std::function<double(int,int)> func_) : 
 		l(l_), kernel(func_)
 	{
-		schar * y = new schar[l];
+		y = new schar[l];
 		memcpy(y, y_, l * sizeof(schar));
 
 		setup();
@@ -149,7 +148,9 @@ private:
 		double ratio = 0.8; // try caching 80% of the share of columns for each node
 
 		// make sure we are not storing more than 95% of the available physical memory
-		max_local_cache = size_t(std::min(ratio * (l / world_size), 0.95 * max_columns));
+		max_local_cache = size_t(std::min(ratio * (l / world_size), 0.9 * static_cast<double>(max_columns)));
+
+		std::cerr << my_rank << ": caching " << max_local_cache << " columns\n";
 
 		// Wait for all nodes to synchronize
 		MPI::COMM_WORLD.Barrier();
@@ -321,7 +322,6 @@ private:
 
 	Qfloat * get_column_cache(int index)
 	{
-		Qfloat * data;
 		RemoteColumn *col = RemoteCacheTable[index];
 
 		if (CacheList.size() >= max_local_cache) {
